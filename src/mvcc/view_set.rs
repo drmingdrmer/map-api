@@ -16,25 +16,20 @@ use std::io;
 
 use seq_marked::SeqMarked;
 
-use crate::mvcc::ScopedGet;
-use crate::mvcc::ViewKey;
-use crate::mvcc::ViewValue;
+use crate::mvcc::ViewGet;
+use crate::MapKey;
 
-/// A view bound to a specific namespace.
+/// A view that owns its sequence boundary.
 ///
-/// This trait provides read-write access to data within a namespace that is embedded
-/// in the view implementation, eliminating the need to specify namespace
-/// parameters for each operation.
+/// This trait provides writes to one key-value space without requiring a sequence
+/// boundary for each operation.
 ///
-/// Extends [`ScopedGet`] with write operations:
-/// - [`set`](Self::set) - Set or delete values within the scoped namespace  
+/// Provides write operations:
+/// - [`set`](Self::set) - Set or delete values
 /// - [`fetch_and_set`](Self::fetch_and_set) - Atomically get old value and set new value, returning both
 #[async_trait::async_trait]
-pub trait ScopedSet<K, V>
-where
-    K: ViewKey,
-    V: ViewValue,
-    Self: ScopedGet<K, V>,
+pub trait ViewSet<K>: ViewGet<K>
+where K: MapKey
 {
     /// Fetch the current value of a key and set it to a new value atomically.
     ///
@@ -42,33 +37,31 @@ where
     /// - `old_value` is the previous value (or `SeqMarked::new_not_found()` if key didn't exist)
     /// - `new_value` is the newly set value (or `SeqMarked::new_tombstone()` if deleted)
     ///
-    /// This is useful for atomic get-then-set operations within the scoped namespace.
+    /// This is useful for atomic get-then-set operations.
     async fn fetch_and_set(
         &mut self,
         key: K,
-        value: Option<V>,
-    ) -> Result<(SeqMarked<V>, SeqMarked<V>), io::Error> {
+        value: Option<K::V>,
+    ) -> Result<(SeqMarked<K::V>, SeqMarked<K::V>), io::Error> {
         let old_value = self.get(key.clone()).await?;
-
         if old_value.is_not_found() && value.is_none() {
-            // No such entry at all, no need to create a tombstone for delete
             return Ok((old_value, SeqMarked::new_tombstone(0)));
         }
 
-        let order_key = self.set(key.clone(), value.clone());
+        let order_key = self.set(key, value.clone());
         let new_value = match value {
-            Some(v) => order_key.map(|_| v),
+            Some(value) => order_key.map(|_| value),
             None => SeqMarked::new_tombstone(*order_key.internal_seq()),
         };
         Ok((old_value, new_value))
     }
 
-    /// Set or delete a value within the scoped namespace.
+    /// Set or delete a value.
     ///
     /// Returns the sequence marker of the newly set value.
     ///
     /// For atomic get-then-set operations, see [`fetch_and_set`](Self::fetch_and_set).
-    fn set(&mut self, key: K, value: Option<V>) -> SeqMarked<()>;
+    fn set(&mut self, key: K, value: Option<K::V>) -> SeqMarked<()>;
 }
 
 #[cfg(test)]
@@ -79,12 +72,17 @@ mod tests {
     use seq_marked::SeqMarked;
 
     use super::*;
+    use crate::MapKey;
 
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
     struct TestKey(String);
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct TestValue(String);
+
+    impl MapKey for TestKey {
+        type V = TestValue;
+    }
 
     fn key(s: &str) -> TestKey {
         TestKey(s.to_string())
@@ -94,11 +92,11 @@ mod tests {
     }
 
     // Mock implementation for testing
-    struct MockScopedView {
+    struct MockView {
         data: BTreeMap<TestKey, SeqMarked<TestValue>>,
     }
 
-    impl MockScopedView {
+    impl MockView {
         fn new() -> Self {
             let mut data = BTreeMap::new();
             data.insert(
@@ -108,10 +106,7 @@ mod tests {
 
             Self { data }
         }
-    }
 
-    #[async_trait::async_trait]
-    impl ScopedGet<TestKey, TestValue> for MockScopedView {
         async fn get(&self, key: TestKey) -> Result<SeqMarked<TestValue>, io::Error> {
             match self.data.get(&key) {
                 Some(value) => Ok(value.clone()),
@@ -121,7 +116,13 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ScopedSet<TestKey, TestValue> for MockScopedView {
+    impl ViewGet<TestKey> for MockView {
+        async fn get(&self, key: TestKey) -> Result<SeqMarked<TestValue>, io::Error> {
+            MockView::get(self, key).await
+        }
+    }
+
+    impl ViewSet<TestKey> for MockView {
         fn set(&mut self, key: TestKey, value: Option<TestValue>) -> SeqMarked<()> {
             match value {
                 Some(v) => {
@@ -137,34 +138,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scoped_view_trait_set_value() {
-        let mut view = MockScopedView::new();
+    async fn test_view_set_value() {
+        let mut view = MockView::new();
         let order_key = view.set(key("new_key"), Some(value("new_value")));
 
         // Should return the order key
         assert_eq!(order_key, SeqMarked::new_normal(2, ()));
 
-        // Verify through the read-only interface
+        // Verify the stored value
         let result = view.get(key("new_key")).await.unwrap();
         assert_eq!(result, SeqMarked::new_normal(2, value("new_value")));
     }
 
     #[tokio::test]
-    async fn test_scoped_view_trait_set_tombstone() {
-        let mut view = MockScopedView::new();
+    async fn test_view_set_tombstone() {
+        let mut view = MockView::new();
         let order_key = view.set(key("tombstone_key"), None);
 
         // Should return the order key for tombstone
         assert_eq!(order_key, SeqMarked::new_tombstone(2));
 
-        // Verify through the read-only interface
+        // Verify the stored value
         let result = view.get(key("tombstone_key")).await.unwrap();
         assert_eq!(result, SeqMarked::new_tombstone(2));
     }
 
     #[tokio::test]
-    async fn test_scoped_view_trait_overwrite_existing() {
-        let mut view = MockScopedView::new();
+    async fn test_view_set_overwrite_existing() {
+        let mut view = MockView::new();
 
         // Verify initial value
         let initial = view.get(key("initial_key")).await.unwrap();
@@ -182,22 +183,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scoped_view_trait_inherits_readonly() {
-        let mut view = MockScopedView::new();
-
-        // Test that ScopedView implements ScopedViewReadonly
-        let order_key = view.set(key("test_key"), Some(value("test_value")));
-
-        // Should return the order key
-        assert_eq!(order_key, SeqMarked::new_normal(2, ()));
-
-        let result = view.get(key("test_key")).await.unwrap();
-        assert_eq!(result, SeqMarked::new_normal(2, value("test_value")));
-    }
-
-    #[tokio::test]
-    async fn test_scoped_view_trait_fetch_and_set_nonexistent() {
-        let mut view = MockScopedView::new();
+    async fn test_view_set_fetch_and_set_nonexistent() {
+        let mut view = MockView::new();
 
         let (old_value, new_value) = view
             .fetch_and_set(key("new_key"), Some(value("new_value")))
@@ -215,8 +202,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scoped_view_trait_fetch_and_set_existing() {
-        let mut view = MockScopedView::new();
+    async fn test_view_set_fetch_and_set_existing() {
+        let mut view = MockView::new();
 
         let (old_value, new_value) = view
             .fetch_and_set(key("initial_key"), Some(value("updated_value")))
@@ -237,8 +224,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scoped_view_trait_fetch_and_set_tombstone() {
-        let mut view = MockScopedView::new();
+    async fn test_view_set_fetch_and_set_tombstone() {
+        let mut view = MockView::new();
 
         let (old_value, new_value) = view.fetch_and_set(key("initial_key"), None).await.unwrap();
 
@@ -253,8 +240,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scoped_view_trait_fetch_and_set_tombstone_to_value() {
-        let mut view = MockScopedView::new();
+    async fn test_view_set_fetch_and_set_tombstone_to_value() {
+        let mut view = MockView::new();
 
         // First delete the key
         view.set(key("initial_key"), None);
@@ -278,8 +265,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scoped_view_trait_fetch_and_set_multiple_operations() {
-        let mut view = MockScopedView::new();
+    async fn test_view_set_fetch_and_set_multiple_operations() {
+        let mut view = MockView::new();
 
         // First operation on existing key
         let (old1, new1) = view
@@ -303,8 +290,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scoped_view_trait_fetch_and_set_delete_nonexistent() {
-        let mut view = MockScopedView::new();
+    async fn test_view_set_fetch_and_set_delete_nonexistent() {
+        let mut view = MockView::new();
 
         // Try to delete a key that doesn't exist
         let (old_value, new_value) = view

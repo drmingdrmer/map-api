@@ -14,87 +14,61 @@
 
 //! Multi-Version Concurrency Control (MVCC) for versioned key-value storage.
 //!
-//! Provides **Read Committed** isolation level with atomic transactions and snapshot consistency.
-//! Data is organized by namespaces with support for concurrent read-write operations.
+//! Provides read-committed isolation with staged writes and snapshot-consistent reads.
 //!
 //! # Architecture
 //!
 //! - **[`Table`]**: In-memory versioned storage with sequence-based ordering
-//! - **[`View`]**: Read-write transaction with staged changes and commit capability
+//! - **[`View`]**: Read-write transaction with staged changes
 //! - **[`Snapshot`]**: Read-only point-in-time view with fixed sequence boundary
-//! - **Scoped APIs**: Namespace-bound convenience methods ([`ScopedApi`], [`ScopedGet`], etc.)
+//! - **[`ViewApi`]**: High-level reads and writes that own their sequence boundary
+//! - **[`GetAtSeq`]** and **[`RangeAtSeq`]**: Low-level reads at an explicit sequence boundary
 //!
 //! # Key Features
 //!
 //! - **Snapshot Isolation**: Each transaction sees consistent data from start time
 //! - **Atomic Commits**: All changes in a transaction commit together or fail together
-//! - **Namespace Partitioning**: Logical separation of data domains
 //! - **Streaming Range Queries**: Memory-efficient iteration over large datasets
 //!
 //! # Usage
 //!
 //! ```rust,ignore
-//! use crate::mvcc::{Table, View};
+//! use crate::mvcc::{Snapshot, Table, View};
+//! use seq_marked::InternalSeq;
 //!
 //! // Create table and transaction view
-//! let table = Table::new();
-//! let mut view = View::new(table);
+//! let table = Table::<String, Vec<u8>>::new();
+//! let snapshot = Snapshot::new(InternalSeq::new(0), table);
+//! let mut view = View::new(snapshot);
 //!
 //! // Stage changes within transaction
-//! view.set(namespace, "key1".to_string(), Some("value1".to_string()));
-//! view.set(namespace, "key2".to_string(), None); // deletion
+//! view.set("key1".to_string(), Some(b"value1".to_vec()));
+//! view.set("key2".to_string(), None); // deletion
 //!
 //! // Read includes staged changes
-//! let current = view.get(namespace, "key1".to_string()).await?;
+//! let current = view.get("key1".to_string()).await?;
 //!
-//! // Atomic commit of all changes
-//! let updated_table = view.commit().await?;
+//! // Give the low-level store the staged changes to commit atomically.
+//! let (_reader, last_seq, changes) = view.into_parts();
 //! ```
 
 pub mod coalesce;
-pub mod commit;
-pub mod key;
-pub mod scoped_api;
-pub mod scoped_get;
-pub mod scoped_range;
-pub mod scoped_read;
-pub mod scoped_seq_bounded_get;
-pub mod scoped_seq_bounded_into_range;
-pub mod scoped_seq_bounded_range;
-pub mod scoped_seq_bounded_range_iter;
-pub mod scoped_set;
-pub mod seq_bounded_get;
-pub mod seq_bounded_into_range;
-pub mod seq_bounded_range;
-pub mod seq_bounded_range_iter;
-pub mod seq_bounded_read;
+pub mod read_at_seq;
 pub mod snapshot;
 pub mod snapshot_seq;
 pub mod table;
-pub mod value;
 pub mod view;
-pub mod view_namespace;
-
-#[cfg(test)]
-mod namespace_view_no_seq_increase_test;
-
-pub use self::commit::Commit;
-pub use self::key::ViewKey;
-pub use self::scoped_api::ScopedApi;
-pub use self::scoped_get::ScopedGet;
-pub use self::scoped_range::ScopedRange;
-pub use self::scoped_read::ScopedRead;
-pub use self::scoped_seq_bounded_get::ScopedSeqBoundedGet;
-pub use self::scoped_seq_bounded_into_range::ScopedSeqBoundedIntoRange;
-pub use self::scoped_seq_bounded_range::ScopedSeqBoundedRange;
-pub use self::scoped_seq_bounded_range_iter::ScopedSeqBoundedRangeIter;
-pub use self::scoped_set::ScopedSet;
-pub use self::seq_bounded_get::SeqBoundedGet;
-pub use self::seq_bounded_range::SeqBoundedRange;
+pub mod view_api;
+pub mod view_get;
+pub mod view_range;
+pub mod view_set;
+pub use self::read_at_seq::GetAtSeq;
+pub use self::read_at_seq::RangeAtSeq;
 pub use self::snapshot::Snapshot;
 pub use self::snapshot_seq::SnapshotSeq;
 pub use self::table::Table;
-pub use self::table::TablesSnapshot;
-pub use self::value::ViewValue;
 pub use self::view::View;
-pub use self::view_namespace::ViewNamespace;
+pub use self::view_api::ViewApi;
+pub use self::view_get::ViewGet;
+pub use self::view_range::ViewRange;
+pub use self::view_set::ViewSet;

@@ -14,12 +14,14 @@
 
 //! Defines the value behavior of the map.
 
+use std::fmt::Debug;
+
 /// MapValue defines the behavior of a value in a map.
 ///
 /// It is `Clone` to let MapApi return an owned value.
 /// It is `Unpin` to let MapApi extract a value from pinned data, such as a stream.
 /// And it only accepts `static` value for simplicity.
-pub trait MapValue: Clone + Send + Sync + Unpin + 'static {}
+pub trait MapValue: Clone + Debug + Send + Sync + Unpin + 'static {}
 
 // Auto implement MapValue for all types that satisfy the constraints.
-impl<V> MapValue for V where V: Clone + Send + Sync + Unpin + 'static {}
+impl<V> MapValue for V where V: Clone + Debug + Send + Sync + Unpin + 'static {}

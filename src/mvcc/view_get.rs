@@ -12,29 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::mvcc::seq_bounded_get::SeqBoundedGet;
-use crate::mvcc::seq_bounded_range::SeqBoundedRange;
-use crate::mvcc::ViewKey;
-use crate::mvcc::ViewNamespace;
-use crate::mvcc::ViewValue;
+use std::io;
 
+use seq_marked::SeqMarked;
+
+use crate::MapKey;
+
+/// Point read operations for a view that owns its sequence boundary.
 #[async_trait::async_trait]
-pub trait SeqBoundedRead<S, K, V>
-where
-    Self: Send + Sync,
-    Self: SeqBoundedGet<S, K, V> + SeqBoundedRange<S, K, V>,
-    S: ViewNamespace,
-    K: ViewKey,
-    V: ViewValue,
+pub trait ViewGet<K>: Send + Sync
+where K: MapKey
 {
-}
+    async fn get(&self, key: K) -> Result<SeqMarked<K::V>, io::Error>;
 
-impl<S, K, V, T> SeqBoundedRead<S, K, V> for T
-where
-    T: Send + Sync,
-    T: SeqBoundedGet<S, K, V> + SeqBoundedRange<S, K, V>,
-    S: ViewNamespace,
-    K: ViewKey,
-    V: ViewValue,
-{
+    async fn get_many(&self, keys: Vec<K>) -> Result<Vec<SeqMarked<K::V>>, io::Error> {
+        let mut values = Vec::with_capacity(keys.len());
+        for key in keys {
+            values.push(self.get(key).await?);
+        }
+        Ok(values)
+    }
 }

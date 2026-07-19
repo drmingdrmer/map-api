@@ -17,24 +17,15 @@ use std::ops::RangeBounds;
 
 use seq_marked::SeqMarked;
 
-use crate::mvcc::ViewKey;
-use crate::mvcc::ViewValue;
 use crate::IOResultStream;
+use crate::MapKey;
 
-/// Read-only range view bound to a namespace that consumes self with snapshot isolation.
-///
-/// Operations are bounded by `snapshot_seq`, ensuring only data with sequences ≤ `snapshot_seq`
-/// is visible. Pre-scoped to eliminate namespace parameters.
-///
-/// ⚠️ **Tombstone Anomaly**: May observe different deletion states for keys with identical sequences.
+/// Range read operations for a view that owns its sequence boundary.
 #[async_trait::async_trait]
-pub trait ScopedRange<K, V>
-where
-    Self: Send + Sync,
-    K: ViewKey,
-    V: ViewValue,
+pub trait ViewRange<K>: Send + Sync
+where K: MapKey
 {
-    /// Returns an async stream of key-value pairs within the specified range, consuming self.
-    async fn range<R>(&self, range: R) -> Result<IOResultStream<(K, SeqMarked<V>)>, io::Error>
+    /// Returns an async stream of key-value pairs within the specified range.
+    async fn range<R>(&self, range: R) -> Result<IOResultStream<(K, SeqMarked<K::V>)>, io::Error>
     where R: RangeBounds<K> + Send + Sync + Clone + 'static;
 }

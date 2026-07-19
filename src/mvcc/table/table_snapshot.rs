@@ -12,37 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::BTreeMap;
-
-use crate::mvcc::snapshot::Snapshot;
-use crate::mvcc::table::Table;
-
-pub type Tables<S, K, V> = BTreeMap<S, Table<K, V>>;
-
-pub type TablesSnapshot<S, K, V> = Snapshot<S, K, V, BTreeMap<S, Table<K, V>>>;
-
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use futures_util::StreamExt;
     use seq_marked::InternalSeq;
     use seq_marked::SeqMarked;
 
-    use super::*;
-    use crate::mvcc::ViewNamespace;
+    use super::super::Table;
+    use crate::mvcc::snapshot::Snapshot;
+    use crate::MapKey;
 
-    // Test types that implement the required traits
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-    enum TestSpace {
-        Space1,
-    }
-
-    impl ViewNamespace for TestSpace {
-        fn increments_seq(&self) -> bool {
-            true
-        }
-    }
+    type TablesSnapshot<K> = Snapshot<K, Table<K, <K as MapKey>::V>>;
 
     #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
     struct TestKey(String);
@@ -50,7 +30,10 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct TestValue(String);
 
-    // Helper functions
+    impl MapKey for TestKey {
+        type V = TestValue;
+    }
+
     fn key(s: &str) -> TestKey {
         TestKey(s.to_string())
     }
@@ -73,26 +56,19 @@ mod tests {
         // Add a key whose tombstone is newer than its normal record
         table.insert(key("k6"), 7, value("v6")).unwrap();
         table.insert_tombstone(key("k6"), 8).unwrap();
-
         table
     }
 
     #[tokio::test]
     async fn test_view_seq() {
-        let mut tables = BTreeMap::new();
-        tables.insert(TestSpace::Space1, create_test_table());
-
-        let view = TablesSnapshot::new(InternalSeq::new(5), tables);
+        let view = TablesSnapshot::new(InternalSeq::new(5), create_test_table());
 
         assert_eq!(view.snapshot_seq(), InternalSeq::new(5));
     }
 
     #[tokio::test]
     async fn test_mget_existing_space() {
-        let mut tables = BTreeMap::new();
-        tables.insert(TestSpace::Space1, create_test_table());
-
-        let view = TablesSnapshot::new(InternalSeq::new(10), tables);
+        let view = TablesSnapshot::new(InternalSeq::new(10), create_test_table());
 
         let keys = vec![
             key("k1"),
@@ -102,7 +78,7 @@ mod tests {
             key("k5"),
             key("k6"),
         ];
-        let result = view.get_many(TestSpace::Space1, keys).await.unwrap();
+        let result = view.get_many(keys).await.unwrap();
 
         assert_eq!(result.len(), 6);
         assert_eq!(result[0], SeqMarked::new_normal(1, value("v1")));
@@ -115,10 +91,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mget_with_tombstone_base_seq_after_tombstone() {
-        let mut tables = BTreeMap::new();
-        tables.insert(TestSpace::Space1, create_test_table());
-
-        let view = TablesSnapshot::new(InternalSeq::new(6), tables);
+        let view = TablesSnapshot::new(InternalSeq::new(6), create_test_table());
 
         let keys = vec![
             key("k1"),
@@ -128,7 +101,7 @@ mod tests {
             key("k5"),
             key("k6"),
         ];
-        let result = view.get_many(TestSpace::Space1, keys).await.unwrap();
+        let result = view.get_many(keys).await.unwrap();
 
         assert_eq!(result.len(), 6);
         assert_eq!(result[0], SeqMarked::new_normal(1, value("v1")));
@@ -141,10 +114,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mget_with_tombstone_base_seq_after_all_tombstones() {
-        let mut tables = BTreeMap::new();
-        tables.insert(TestSpace::Space1, create_test_table());
-
-        let view = TablesSnapshot::new(InternalSeq::new(8), tables);
+        let view = TablesSnapshot::new(InternalSeq::new(8), create_test_table());
 
         let keys = vec![
             key("k1"),
@@ -154,7 +124,7 @@ mod tests {
             key("k5"),
             key("k6"),
         ];
-        let result = view.get_many(TestSpace::Space1, keys).await.unwrap();
+        let result = view.get_many(keys).await.unwrap();
 
         assert_eq!(result.len(), 6);
         assert_eq!(result[0], SeqMarked::new_normal(1, value("v1")));
@@ -167,13 +137,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_range_existing_space() {
-        let mut tables = BTreeMap::new();
-        tables.insert(TestSpace::Space1, create_test_table());
-
-        let view = TablesSnapshot::new(InternalSeq::new(10), tables);
+        let view = TablesSnapshot::new(InternalSeq::new(10), create_test_table());
 
         let range = key("k1")..=key("k6");
-        let mut stream = view.range(TestSpace::Space1, range).await.unwrap();
+        let mut stream = view.range(range).await.unwrap();
 
         let mut results = Vec::new();
         while let Some(result) = stream.next().await {

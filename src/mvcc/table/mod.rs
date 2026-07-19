@@ -13,10 +13,9 @@
 // limitations under the License.
 
 pub mod errors;
-mod impl_scoped_seq_bounded_get;
-mod impl_scoped_seq_bounded_range_iter;
 mod merge;
 pub mod range_iter;
+#[cfg(test)]
 mod table_snapshot;
 
 use std::cmp::Reverse;
@@ -29,8 +28,6 @@ use errors::InsertError;
 use futures::Stream;
 use futures_util::TryStreamExt;
 use range_iter::RangeIter;
-pub use table_snapshot::Tables;
-pub use table_snapshot::TablesSnapshot;
 
 use crate::SeqMarked;
 
@@ -59,8 +56,8 @@ pub struct Table<K, V> {
 
     /// Tracks the highest sequence number in this table.
     ///
-    /// Note: The last inserted record may be a tombstone, as tombstone insertions
-    /// can increment the sequence number depending on namespace configuration.
+    /// Note: The last inserted record may be a tombstone. Multiple records may share a
+    /// sequence when a view does not increment it for a secondary change.
     pub last_seq: SeqMarked<()>,
 }
 
@@ -197,7 +194,7 @@ impl<K: Ord + Clone, V> Table<K, V> {
         seq_marked: SeqMarked<()>,
         value: Option<V>,
     ) -> Result<(), InsertError> {
-        // If a namespace disable seq incr, same InternalSeq may be inserted
+        // Multiple records may use the same sequence.
 
         if *seq_marked.internal_seq() >= *self.last_seq.internal_seq() {
             // ok

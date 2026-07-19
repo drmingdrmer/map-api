@@ -12,66 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! MVCC snapshot providing consistent point-in-time reads and transactional commits.
-//!
-//! Snapshots capture a consistent view of data at a specific sequence number,
-//! ensuring all reads see the same data state regardless of concurrent writes.
+//! Point-in-time reads over a single key-value space.
 
-use std::collections::BTreeMap;
 use std::io;
 use std::marker::PhantomData;
 use std::ops::RangeBounds;
 
 use seq_marked::InternalSeq;
 
-use crate::mvcc::seq_bounded_get::SeqBoundedGet;
-use crate::mvcc::seq_bounded_range::SeqBoundedRange;
-use crate::mvcc::Commit;
-use crate::mvcc::Table;
-use crate::mvcc::ViewKey;
-use crate::mvcc::ViewNamespace;
-use crate::mvcc::ViewValue;
+use crate::mvcc::GetAtSeq;
+use crate::mvcc::RangeAtSeq;
 use crate::IOResultStream;
+use crate::MapKey;
 use crate::SeqMarked;
 
-/// MVCC snapshot with fixed sequence boundary for consistent reads and commit operations.
-///
-/// Provides a point-in-time view of data at a specific sequence number, ensuring all
-/// read operations see the same consistent state regardless of concurrent writes.
-/// Sequence-bounded reads filter out any changes with sequence numbers greater than
-/// the snapshot's sequence boundary.
-///
-/// # Type Parameters
-/// - `S`: Namespace type for organizing data by logical partitions
-/// - `K`: Key type that must satisfy [`ViewKey`] constraints
-/// - `V`: Value type that must satisfy [`ViewValue`] constraints
-/// - `D`: Data source implementing sequential read and commit operations
+/// A fixed sequence boundary over a low-level reader.
 #[derive(Clone, Debug, Default)]
-pub struct Snapshot<S, K, V, D>
+pub struct Snapshot<K, D>
 where
-    S: ViewNamespace,
-    K: ViewKey,
-    V: ViewValue,
-    D: SeqBoundedGet<S, K, V>,
-    D: SeqBoundedRange<S, K, V>,
-    D: Commit<S, K, V>,
-    D: Send + Sync,
+    K: MapKey,
+    D: GetAtSeq<K> + RangeAtSeq<K>,
 {
-    /// The snapshot sequence number. Values with sequence numbers greater than this will be invisible.
     snapshot_seq: InternalSeq,
     data: D,
-    _phantom: PhantomData<(S, K, V)>,
+    _phantom: PhantomData<K>,
 }
 
-impl<S, K, V, D> Snapshot<S, K, V, D>
+impl<K, D> Snapshot<K, D>
 where
-    S: ViewNamespace,
-    K: ViewKey,
-    V: ViewValue,
-    D: SeqBoundedGet<S, K, V>,
-    D: SeqBoundedRange<S, K, V>,
-    D: Commit<S, K, V>,
-    D: Send + Sync,
+    K: MapKey,
+    D: GetAtSeq<K> + RangeAtSeq<K>,
 {
     pub fn new(snapshot_seq: InternalSeq, data: D) -> Self {
         Self {
@@ -85,40 +55,30 @@ where
         self.snapshot_seq
     }
 
-    /// Retrieves the value for a key up to the snapshot sequence (inclusive).
-    pub async fn get(&self, space: S, key: K) -> Result<SeqMarked<V>, io::Error> {
-        self.data.get(space, key, *self.snapshot_seq).await
+    pub async fn get(&self, key: K) -> Result<SeqMarked<K::V>, io::Error> {
+        self.data.get_at_seq(key, *self.snapshot_seq).await
     }
 
-    /// Retrieves values for multiple keys up to the snapshot sequence (inclusive).
-    pub async fn get_many(&self, space: S, keys: Vec<K>) -> Result<Vec<SeqMarked<V>>, io::Error> {
-        self.data.get_many(space, keys, *self.snapshot_seq).await
+    pub async fn get_many(&self, keys: Vec<K>) -> Result<Vec<SeqMarked<K::V>>, io::Error> {
+        self.data.get_many_at_seq(keys, *self.snapshot_seq).await
     }
 
-    /// Returns a range of key-value pairs up to the snapshot sequence (inclusive).
     pub async fn range<R>(
         &self,
-        space: S,
         range: R,
-    ) -> Result<IOResultStream<(K, SeqMarked<V>)>, io::Error>
+    ) -> Result<IOResultStream<(K, SeqMarked<K::V>)>, io::Error>
     where
         R: RangeBounds<K> + Send + Sync + Clone + 'static,
     {
-        self.data.range(space, range, *self.snapshot_seq).await
-    }
-
-    /// Commits changes to the underlying data store and returns the updated data handle.
-    pub async fn commit(
-        mut self,
-        new_seq: InternalSeq,
-        changes: BTreeMap<S, Table<K, V>>,
-    ) -> Result<D, io::Error> {
-        self.data.commit(new_seq, changes).await?;
-        Ok(self.data)
+        self.data.range_at_seq(range, *self.snapshot_seq).await
     }
 
     pub fn data(&self) -> &D {
         &self.data
+    }
+
+    pub fn into_data(self) -> D {
+        self.data
     }
 }
 
@@ -131,15 +91,6 @@ mod tests {
 
     use super::*;
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-    struct TestSpace(u8);
-
-    impl ViewNamespace for TestSpace {
-        fn increments_seq(&self) -> bool {
-            true
-        }
-    }
-
     #[derive(Debug, Clone)]
     struct MockData {
         calls: Arc<Mutex<Vec<String>>>,
@@ -151,101 +102,49 @@ mod tests {
                 calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
-
-        fn record_call(&self, call: &str) {
-            self.calls.lock().unwrap().push(call.to_string());
-        }
-
-        fn get_calls(&self) -> Vec<String> {
-            self.calls.lock().unwrap().clone()
-        }
     }
 
     #[async_trait::async_trait]
-    impl SeqBoundedGet<TestSpace, String, String> for MockData {
-        async fn get(
+    impl GetAtSeq<String> for MockData {
+        async fn get_at_seq(
             &self,
-            _space: TestSpace,
-            _k: String,
+            _key: String,
             seq: u64,
-        ) -> Result<SeqMarked<String>, io::Error> {
-            self.record_call(&format!("get(seq:{})", seq));
+        ) -> Result<SeqMarked<Vec<u8>>, io::Error> {
+            self.calls.lock().unwrap().push(format!("get:{seq}"));
             Ok(SeqMarked::new_not_found())
         }
-
-        async fn get_many(
-            &self,
-            _space: TestSpace,
-            _keys: Vec<String>,
-            seq: u64,
-        ) -> Result<Vec<SeqMarked<String>>, io::Error> {
-            self.record_call(&format!("get_many(seq:{})", seq));
-            Ok(vec![])
-        }
     }
 
     #[async_trait::async_trait]
-    impl SeqBoundedRange<TestSpace, String, String> for MockData {
-        async fn range<R>(
+    impl RangeAtSeq<String> for MockData {
+        async fn range_at_seq<R>(
             &self,
-            _space: TestSpace,
             _range: R,
             seq: u64,
-        ) -> Result<IOResultStream<(String, SeqMarked<String>)>, io::Error>
+        ) -> Result<IOResultStream<(String, SeqMarked<Vec<u8>>)>, io::Error>
         where
             R: RangeBounds<String> + Send + Sync + Clone + 'static,
         {
-            self.record_call(&format!("range(seq:{})", seq));
+            self.calls.lock().unwrap().push(format!("range:{seq}"));
             Ok(futures::stream::empty().boxed())
         }
     }
 
-    #[async_trait::async_trait]
-    impl Commit<TestSpace, String, String> for MockData {
-        async fn commit(
-            &mut self,
-            seq: InternalSeq,
-            _changes: BTreeMap<TestSpace, Table<String, String>>,
-        ) -> Result<(), io::Error> {
-            self.record_call(&format!("commit(seq:{})", *seq));
-            Ok(())
-        }
-    }
-
     #[tokio::test]
-    async fn test_snapshot_delegates_to_data() {
-        let mock = MockData::new();
-        let snapshot = Snapshot {
-            snapshot_seq: InternalSeq::new(42),
-            data: mock.clone(),
-            _phantom: PhantomData,
-        };
+    async fn test_snapshot_binds_sequence() {
+        let data = MockData::new();
+        let snapshot = Snapshot::new(InternalSeq::new(42), data.clone());
 
-        snapshot.get(TestSpace(1), "k".to_string()).await.unwrap();
+        snapshot.get("k".to_string()).await.unwrap();
         snapshot
-            .get_many(TestSpace(1), vec!["k".to_string()])
+            .get_many(vec!["k1".to_string(), "k2".to_string()])
             .await
             .unwrap();
-        let _stream = snapshot.range(TestSpace(1), ..).await.unwrap();
+        let _stream = snapshot.range(..).await.unwrap();
 
-        let calls = mock.get_calls();
-        assert_eq!(calls, vec![
-            "get(seq:42)",
-            "get_many(seq:42)",
-            "range(seq:42)"
+        assert_eq!(*data.calls.lock().unwrap(), vec![
+            "get:42", "get:42", "get:42", "range:42"
         ]);
-
-        let mock2 = MockData::new();
-        let snapshot2 = Snapshot {
-            snapshot_seq: InternalSeq::new(99),
-            data: mock2.clone(),
-            _phantom: PhantomData,
-        };
-
-        snapshot2
-            .commit(InternalSeq::new(100), BTreeMap::new())
-            .await
-            .unwrap();
-        assert_eq!(mock2.get_calls(), vec!["commit(seq:100)"]);
     }
 }
